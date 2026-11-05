@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ERP Invoice Submission Form</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: #f3f4f6;
+            margin: 0;
+            padding: 40px 20px;
+            display: flex;
+            justify-content: center;
+        }
+        .container {
+            background: #ffffff;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            max-width: 550px;
+            width: 100%;
+            padding: 32px;
+        }
+        h2 {
+            margin-top: 0;
+            color: #111827;
+            font-size: 24px;
+            border-bottom: 2px solid #2563eb;
+            padding-bottom: 12px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 6px;
+            font-weight: 600;
+            color: #374151;
+            font-size: 14px;
+        }
+        input[type="text"], input[type="number"] {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 10px 14px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            font-size: 14px;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        input:focus {
+            border-color: #2563eb;
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+        }
+        button {
+            width: 100%;
+            background-color: #2563eb;
+            color: white;
+            padding: 12px;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        button:hover {
+            background-color: #1d4ed8;
+        }
+        #confirmation {
+            display: none;
+            margin-top: 24px;
+            padding: 16px;
+            border-radius: 6px;
+            background-color: #ecfdf5;
+            border: 1px solid #10b981;
+            color: #065f46;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>ERP System - Invoice Entry</h2>
+        <form id="erpForm" onsubmit="event.preventDefault(); submitForm();">
+            <div class="form-group">
+                <label for="invoice_number">Invoice Number</label>
+                <input type="text" id="invoice_number" name="invoice_number" data-automation-id="textInput" required>
+            </div>
+            <div class="form-group">
+                <label for="vendor_name">Vendor Name</label>
+                <input type="text" id="vendor_name" name="vendor_name" data-automation-id="textInput" required>
+            </div>
+            <div class="form-group">
+                <label for="po_number">PO Number</label>
+                <input type="text" id="po_number" name="po_number" data-automation-id="textInput" required>
+            </div>
+            <div class="form-group">
+                <label for="amount">Amount</label>
+                <input type="text" id="amount" name="amount" data-automation-id="textInput" required>
+            </div>
+            <div class="form-group">
+                <label for="currency">Currency</label>
+                <input type="text" id="currency" name="currency" data-automation-id="textInput" required>
+            </div>
+            <div class="form-group">
+                <label for="posting_ref">Posting Reference</label>
+                <input type="text" id="posting_ref" name="posting_ref" data-automation-id="textInput" required>
+            </div>
+            <button type="submit" id="submitBtn" data-automation-id="submitButton">Submit to ERP</button>
+        </form>
+
+        <div id="confirmation">
+            <strong>Submission Confirmed!</strong>
+            <p>Invoice has been successfully recorded in the ERP system.</p>
+            <p id="confirmedRef"></p>
+        </div>
+    </div>
+
+    <script>
+        function submitForm() {
+            document.getElementById('erpForm').style.display = 'none';
+            var ref = document.getElementById('posting_ref').value;
+            document.getElementById('confirmedRef').innerText = 'Posting Reference: ' + ref;
+            document.getElementById('confirmation').style.display = 'block';
+        }
+    </script>
+</body>
+</html>
