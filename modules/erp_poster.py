@@ -112,142 +112,140 @@ class ERPBrowserPoster:
             # 1. Navigate to form
             ws.send(json.dumps({"id": 1, "method": "Page.navigate", "params": {"url": target_url}}))
             ws.recv()
-            time.sleep(2.5)  # Wait for page elements to render
+            time.sleep(3.5)  # Wait for page elements to render
 
-            # 2. Inject form data using universal script for Google Forms, MS Forms & Mock Form
-            js_script = f"""
-            (function() {{
-                const data = {{
-                    invoiceNumber: "{invoice_data.get('invoice_number', '')}",
-                    vendorName: "{invoice_data.get('vendor_name', '')}",
-                    poNumber: "{invoice_data.get('po_number', '')}",
-                    amount: "{invoice_data.get('amount', '')}",
-                    currency: "{invoice_data.get('currency', 'IDR')}",
-                    postingRef: "{posting_ref}"
-                }};
+            approver_email = self.config.approver_email or "aldidadenis@gmail.com"
+            inv_num = str(invoice_data.get('invoice_number', ''))
+            vendor = str(invoice_data.get('vendor_name', ''))
+            po_num = str(invoice_data.get('po_number', ''))
+            amt = str(int(invoice_data.get('amount', 0)) if float(invoice_data.get('amount', 0)).is_integer() else invoice_data.get('amount', 0))
+            curr = str(invoice_data.get('currency', 'IDR'))
 
-                const values = [
-                    data.invoiceNumber,
-                    data.vendorName,
-                    data.poNumber,
-                    data.amount,
-                    data.currency,
-                    data.postingRef
-                ];
+            # Check if this is the built-in mock ERP form
+            check_mock_js = "!!document.getElementById('erpForm')"
+            ws.send(json.dumps({"id": 2, "method": "Runtime.evaluate", "params": {"expression": check_mock_js, "returnByValue": True}}))
+            is_mock = json.loads(ws.recv()).get("result", {}).get("result", {}).get("value", False)
 
-                function setVal(input, val) {{
-                    if (!input) return;
-                    input.focus();
-                    input.value = val;
-                    try {{ document.execCommand('selectAll', false, null); }} catch(e){{}}
-                    try {{ document.execCommand('insertText', false, String(val)); }} catch(e){{}}
-                    input.value = val;
-                    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    try {{ input.dispatchEvent(new InputEvent('input', {{ bubbles: true, data: String(val) }})); }} catch(e){{}}
-                    input.blur();
-                }}
+            if is_mock:
+                mock_fill = f"""
+                (() => {{
+                    document.getElementById('invoice_number').value = "{inv_num}";
+                    document.getElementById('vendor_name').value = "{vendor}";
+                    document.getElementById('po_number').value = "{po_num}";
+                    document.getElementById('amount').value = "{amt}";
+                    document.getElementById('currency').value = "{curr}";
+                    document.getElementById('posting_ref').value = "{posting_ref}";
+                    document.getElementById('submitBtn').click();
+                    return true;
+                }})()
+                """
+                ws.send(json.dumps({"id": 3, "method": "Runtime.evaluate", "params": {"expression": mock_fill, "returnByValue": True}}))
+                ws.recv()
+                time.sleep(1.0)
+            else:
+                # Live Google Forms / MS Forms via native CDP input simulation
+                # Step 2a: Fill email if present
+                ws.send(json.dumps({
+                    "id": 10,
+                    "method": "Runtime.evaluate",
+                    "params": {"expression": """
+                        (() => {
+                            const el = document.querySelector('input[type="email"]') || document.querySelector('input[autocomplete="email"]');
+                            if (el) { el.focus(); el.click(); return true; }
+                            return false;
+                        })()
+                    """, "returnByValue": True}
+                }))
+                has_email = json.loads(ws.recv()).get("result", {}).get("result", {}).get("value", False)
+                if has_email:
+                    ws.send(json.dumps({"id": 11, "method": "Input.insertText", "params": {"text": approver_email}}))
+                    ws.recv()
+                    time.sleep(0.3)
 
-                // Method 1: Check Mock Form or standard ID inputs
-                const idMap = {{
-                    'invoice_number': data.invoiceNumber,
-                    'vendor_name': data.vendorName,
-                    'po_number': data.poNumber,
-                    'amount': data.amount,
-                    'currency': data.currency,
-                    'posting_ref': data.postingRef
-                }};
+                # Step 2b: Fill invoice data fields
+                fields = [
+                    ("posting", posting_ref),
+                    ("invoice", inv_num),
+                    ("vendor", vendor),
+                    ("po", po_num),
+                    ("amount", amt),
+                    ("currency", curr)
+                ]
+                for key, val in fields:
+                    focus_js = f"""
+                    (() => {{
+                        const items = Array.from(document.querySelectorAll('div[role="listitem"]'));
+                        for (const it of items) {{
+                            const h = (it.querySelector('[role="heading"]')?.innerText || it.innerText || '').toLowerCase();
+                            const inp = it.querySelector('input:not([type="email"]):not([type="hidden"]), textarea');
+                            if (!inp) continue;
 
-                let filledCount = 0;
-                for (const [id, val] of Object.entries(idMap)) {{
-                    const el = document.getElementById(id);
-                    if (el) {{
-                        setVal(el, val);
-                        filledCount++;
-                    }}
-                }}
+                            let match = false;
+                            if ('{key}' === 'posting' && (h.includes('posting') || h.includes('ref'))) match = true;
+                            else if ('{key}' === 'invoice' && (h.includes('invoice') || h.includes('faktur'))) match = true;
+                            else if ('{key}' === 'vendor' && (h.includes('vendor') || h.includes('pemasok'))) match = true;
+                            else if ('{key}' === 'po' && !h.includes('posting') && (h.includes('po') || h.includes('purchase'))) match = true;
+                            else if ('{key}' === 'amount' && (h.includes('amount') || h.includes('nominal') || h.includes('total'))) match = true;
+                            else if ('{key}' === 'currency' && (h.includes('currency') || h.includes('mata uang') || h.includes('uang'))) match = true;
 
-                // Method 2: Google Forms smart container matching by label/question
-                if (filledCount < 6) {{
-                    const containers = Array.from(document.querySelectorAll('div[role="listitem"], .Qr7Oae, div[jsmodel]'));
-                    if (containers.length > 0) {{
-                        containers.forEach(container => {{
-                            const text = (container.innerText || container.textContent || '').toLowerCase();
-                            const inp = container.querySelector('input[type="text"], input:not([type]), textarea');
-                            if (!inp) return;
-
-                            if (text.includes('invoice') || text.includes('faktur')) {{
-                                setVal(inp, data.invoiceNumber);
-                                filledCount++;
-                            }} else if (text.includes('vendor') || text.includes('pemasok')) {{
-                                setVal(inp, data.vendorName);
-                                filledCount++;
-                            }} else if (text.includes('po') || text.includes('purchase')) {{
-                                setVal(inp, data.poNumber);
-                                filledCount++;
-                            }} else if (text.includes('amount') || text.includes('nominal') || text.includes('total') || text.includes('jumlah')) {{
-                                setVal(inp, data.amount);
-                                filledCount++;
-                            }} else if (text.includes('currency') || text.includes('uang')) {{
-                                setVal(inp, data.currency);
-                                filledCount++;
-                            }} else if (text.includes('posting') || text.includes('ref')) {{
-                                setVal(inp, data.postingRef);
-                                filledCount++;
+                            if (match) {{
+                                inp.focus();
+                                inp.click();
+                                return true;
                             }}
-                        }});
-                    }}
-                }}
-
-                // Method 3: Fallback to sequential visible inputs (MS Forms / Google Forms)
-                if (filledCount < 6) {{
-                    const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type]), textarea'));
-                    const targetInputs = inputs.filter(el => el.offsetParent !== null || el.offsetWidth > 0);
-                    targetInputs.slice(0, 6).forEach((input, idx) => {{
-                        if (values[idx] !== undefined) {{
-                            setVal(input, values[idx]);
                         }}
-                    }});
-                }}
+                        return false;
+                    }})()
+                    """
+                    ws.send(json.dumps({"id": 20, "method": "Runtime.evaluate", "params": {"expression": focus_js, "returnByValue": True}}))
+                    focused = json.loads(ws.recv()).get("result", {}).get("result", {}).get("value", False)
+                    if focused:
+                        ws.send(json.dumps({"id": 21, "method": "Input.insertText", "params": {"text": str(val)}}))
+                        ws.recv()
+                        time.sleep(0.3)
 
-                // Click submit button for Google Forms / MS Forms / Mock Form
-                setTimeout(() => {{
-                    const allButtons = Array.from(document.querySelectorAll('div[role="button"], button, input[type="submit"]'));
-                    const submitBtn = allButtons.find(b => {{
+                # Step 2c: Click Submit Button
+                submit_js = """
+                (() => {
+                    const buttons = Array.from(document.querySelectorAll('div[role="button"], button, input[type="submit"]'));
+                    const btn = buttons.find(b => {
                         const txt = (b.innerText || b.textContent || b.value || '').trim().toLowerCase();
-                        const aria = (b.getAttribute('aria-label') || '').toLowerCase();
-                        return txt === 'kirim' || txt === 'submit' || txt === 'send' ||
-                               txt.includes('kirim') || txt.includes('submit') ||
-                               b.getAttribute('data-automation-id') === 'submitButton' ||
-                               aria.includes('kirim') || aria.includes('submit') ||
-                               b.type === 'submit';
-                    }}) || document.querySelector('div[role="button"][jscontroller]') ||
-                          document.querySelector('button[type="submit"]') ||
-                          document.querySelector('button');
+                        return txt === 'kirim' || txt === 'submit' || txt === 'send';
+                    });
+                    if (btn) { btn.click(); return true; }
+                    return false;
+                })()
+                """
+                ws.send(json.dumps({"id": 30, "method": "Runtime.evaluate", "params": {"expression": submit_js, "returnByValue": True}}))
+                ws.recv()
+                time.sleep(4.0)
 
-                    if (submitBtn) {{
-                        submitBtn.click();
-                    }}
-                }}, 700);
-
-                return true;
-            }})();
+            # 4. Verify submission success
+            verify_script = """
+            (() => {
+                const url = window.location.href.toLowerCase();
+                const bodyText = (document.body.innerText || document.body.textContent || '').toLowerCase();
+                return url.includes('formresponse') ||
+                       bodyText.includes('response has been recorded') ||
+                       bodyText.includes('telah direkam') ||
+                       bodyText.includes('submission confirmed') ||
+                       bodyText.includes('terima kasih') ||
+                       bodyText.includes('berhasil');
+            })()
             """
-
             ws.send(json.dumps({
-                "id": 2,
+                "id": 40,
                 "method": "Runtime.evaluate",
-                "params": {"expression": js_script}
+                "params": {"expression": verify_script, "returnByValue": True}
             }))
-            ws.recv()
-
-            time.sleep(2.0)  # Allow form submission to complete
+            verify_res = json.loads(ws.recv())
+            success = verify_res.get("result", {}).get("result", {}).get("value", False)
 
             return PostingResult(
                 posting_ref=posting_ref,
-                success=True,
+                success=success,
                 submitted_at=submitted_at,
-                message=f"Form submitted successfully at {target_url}"
+                message=f"Form submitted successfully at {target_url}" if success else f"Form submission unconfirmed at {target_url}"
             )
 
         except Exception as e:
