@@ -1,140 +1,74 @@
 # IT Automation System - End-to-End Invoice Processing
 
-Sistem otomasi pemrosesan faktur (invoice) berbasis Python dengan arsitektur standar industri, *maintainable*, *scalable*, dan *clean code*. Mengintegrasikan **Email Intake (IMAP/SMTP) → Google Cloud Vision OCR → Regex Extraction → Database SQLite → PO Validation → Email Approval → Browser ERP Posting → Excel Export & Archiving**.
+Sistem otomasi pemrosesan faktur (invoice) berbasis Python. Menangani alur kerja lengkap: ekstraksi dokumen, validasi master data, alur persetujuan, entri data ERP via browser, hingga audit logging dan pengarsipan.
 
 ---
 
-## 1. Arsitektur & Struktur Direktori
+## 1. Ringkasan Sistem Otomasi
 
-Sistem dirancang modular mengikuti prinsip pemisahan tanggung jawab (*Separation of Concerns*) dan *Clean Architecture*:
+Sistem memproses faktur masuk secara sekuensial dengan tahapan:
+1. **Intake**: Membaca file faktur (`.jpg`, `.jpeg`, `.png`, `.pdf`) dari folder lokal (`inbox/`, `Sample Invoice/`) atau mailbox IMAP email.
+2. **Preprocessing & OCR**: Inspeksi kualitas gambar (blur, pencahayaan, kemiringan, noda) dengan OpenCV, dilanjutkan ekstraksi teks via Google Cloud Vision API.
+3. **Ekstraksi Data**: Parser berbasis RegEx deterministik untuk mengambil `InvoiceNumber`, `VendorName`, `PO_Number`, `Amount`, dan `Currency`.
+4. **Validasi Master PO**: Verifikasi silang data faktur terhadap `PurchaseOrders.csv` (kecocokan vendor, status aktif PO, mata uang, dan nominal).
+5. **Approval Workflow**: Evaluasi batas nominal (`ThresholdAmount` dari `Config.xlsx`). Faktur melebihi batas memerlukan persetujuan via email approver (`aldidadenis@gmail.com`) atau prompt terminal interaktif.
+6. **Posting ERP Form**: Otomasi browser (Microsoft Edge / Google Chrome) untuk mengisi form ERP (Google Forms / Microsoft Forms / mock HTML offline) dan menghasilkan `PostingRef`.
+7. **Export & Archiving**: Sinkronisasi data transaksi ke file Excel (`Invoices.xlsx`, `ERP_Dummy.xlsx`, `ProcessLogs.xlsx`) serta pemindahan fisik dokumen ke `Processed/Success/`, `Processed/Rejected/`, atau `Processed/Failed/`.
 
-```
-IT Automation Developer Use Case/
-├── config/
-│   ├── __init__.py
-│   └── settings.py          # Dynamic configuration loader (Config.xlsx, .env, defaults)
-├── core/
-│   ├── __init__.py
-│   ├── database.py          # SQLite repository (invoices, erp_postings, process_logs)
-│   └── logger.py            # Structured logging & ProcessLogs database sink
-├── modules/
-│   ├── __init__.py
-│   ├── email_intake.py      # IMAP mail listener & local folder attachment loader
-│   ├── ocr_engine.py        # Google Cloud Vision API OCR client
-│   ├── image_preprocessor.py# CV quality assessment & auto-enhancement (blur, skew, dark, flash, stains)
-│   ├── extractor.py         # Regex extractor untuk field invoice
-│   ├── validator.py         # Purchase order validator (PurchaseOrders.csv)
-│   ├── approval.py          # Dynamic threshold approval workflow (SMTP/IMAP & CLI prompt)
-│   ├── erp_poster.py        # Browser automation (CDP / Selenium: Edge & Chrome, Headless switch)
-│   ├── archiver.py          # File categorizer & deduplicated mover ke /Processed/<Result>
-│   └── exporter.py          # Excel exporter sinkronisasi template (file lock safe)
-├── templates/
-│   ├── Config.xlsx          # Konfigurasi parameter bisnis
-│   ├── Invoices.xlsx        # Template export tabel Invoices_T
-│   ├── ERP_Dummy.xlsx       # Template export tabel PostedInvoices
-│   ├── ProcessLogs.xlsx     # Template audit log tabel Logs_T
-│   └── mock_erp_form.html   # Standalone HTML ERP form untuk pengujian offline/lokal
-├── tests/
-│   ├── __init__.py
-│   └── test_automation.py   # Unit & integration verification test suite
-├── data/
-│   └── automation.db        # SQLite persistence database (auto-generated)
-├── inbox/                   # Folder intake email attachment lokal
-├── Processed/               # Hasil akhir arsip invoice
-│   ├── Success/
-│   ├── Rejected/
-│   └── Failed/
-├── Sample Invoice/          # Sampel gambar invoice pengujian
-├── .env.example             # Template konfigurasi environment & secrets
-├── .env                     # File konfigurasi aktif lokal
-├── main.py                  # CLI entrypoint & orchestrator pipeline
-├── PurchaseOrders.csv       # Data master Purchase Order
-├── requirements.txt         # Daftar dependensi Python
-└── README.md                # Dokumentasi sistem
+---
+
+## 2. Prasyarat & Persiapan
+
+Siapkan komponen berikut sebelum instalasi:
+- **Python**: Versi `3.10` atau lebih baru.
+- **Web Browser**: Microsoft Edge atau Google Chrome terpasang di sistem.
+- **Google Cloud Vision API Key**: Kunci API aktif (sudah disertakan default di `.env.example`).
+- **Form ERP URL**: Tautan Google Form dengan 6 field (Invoice Number, Vendor Name, PO Number, Amount, Currency, Posting Reference). Jika tidak diisi, sistem otomatis beralih ke form lokal `templates/mock_erp_form.html`.
+- **Kredensial Mailbox (Opsional)**: Akun Gmail + App Password jika menggunakan fitur intake email IMAP atau pengiriman email persetujuan SMTP live.
+
+---
+
+## 3. Instalasi & Setup Awal
+
+Panduan setup untuk pengguna atau developer baru:
+
+### 1. Clone Repository
+```bash
+git clone <repository_url>
+cd "IT Automation Developer Use Case"
 ```
 
----
+### 2. Buat & Aktifkan Virtual Environment
+```bash
+# Windows
+python -m venv venv
+.\venv\Scripts\activate
 
-## 2. Alur Kerja Sistem (End-to-End Pipeline)
+# Linux / macOS
+python3 -m venv venv
+source venv/bin/activate
+```
 
-1. **Email Intake:**
-   - Mendengarkan email masuk pada akun IMAP yang memiliki lampiran gambar invoice (`.jpg`, `.jpeg`, `.png`, `.pdf`) dan menyimpannya ke direktori `inbox/`.
-   - Mendukung fallback mode untuk memproses file lokal langsung dari folder (misal: `Sample Invoice/`).
-
-2. **OCR & Regex Extraction:**
-   - Mengirim file gambar ke Google Cloud Vision REST API.
-   - Melakukan ekstraksi deterministik menggunakan *regular expressions* untuk:
-     - `InvoiceNumber`: format `INV-YYYY-XXX`
-     - `VendorName`: nama perusahaan dengan prefix `PT`/`CV`/`UD` atau label
-     - `PO_Number`: format `PO-XXX`
-     - `Amount`: nominal angka faktur
-     - `Currency`: default `IDR`
-   - Mendeteksi faktur rusak/tidak valid (*corrupted/invalid/noise*).
-
-3. **Database SQLite:**
-   - Menyimpan seluruh status transaksi, `CorrelationId`, nominal, relasi PO, dan timestamp ke dalam tabel `invoices` pada database `data/automation.db`.
-
-4. **Validasi Purchase Order (PO):**
-   - Memvalidasi data invoice terhadap master `PurchaseOrders.csv`:
-     - Memastikan `PO_Number` terdaftar.
-     - Memastikan status `IsActive == TRUE`.
-     - Memastikan `VendorName`, `Currency`, dan `TotalAmount` cocok presisi.
-   - Menghasilkan status: `MATCHED`, `MISMATCH`, `NOT_FOUND`, `INACTIVE_PO`, atau `INVALID`.
-
-5. **Approval Workflow (Dynamic Threshold):**
-   - Membaca `ThresholdAmount` secara dinamis dari file `Config.xlsx` dan `ApproverEmail` (`aldidadenis@gmail.com`).
-   - Jika `Amount > ThresholdAmount` (dan PO lolos validasi):
-     - Mengirim notifikasi request approval via SMTP/IMAP ke `aldidadenis@gmail.com`.
-     - Mendukung balasan `APPROVE` / `REJECT` via IMAP, prompt terminal interaktif (`Y/n`), serta flag `--auto-approve`.
-   - Setelah faktur disetujui (APPROVED) dan berhasil diposting ke ERP:
-     - Mengirimkan email konfirmasi invoice yang sudah approved ke `aldidadenis@gmail.com` beserta lampiran dokumen invoice dan `PostingRef`.
-
-6. **Posting ERP Form (Google Forms / MS Forms / Browser Automation):**
-   - Mengirim data faktur (`InvoiceNumber`, `VendorName`, `PO_Number`, `Amount`, `Currency`, `PostingRef`) ke Google Form atau web form ERP melalui browser (Microsoft Edge / Google Chrome).
-   - Menggunakan teknologi Chrome DevTools Protocol (CDP) native yang stabil tanpa kendala versi driver eksternal.
-   - Menjamin nilai `PostingRef` identik pada response form, `ERP_Dummy.xlsx`, dan `Invoices.xlsx`.
-   - Mendukung visual browser (visible) dan mode *headless*.
-
-7. **Export & Archiving:**
-   - Database SQLite disinkronkan secara *fresh* untuk setiap *running batch* aktif agar data lama yang sudah selesai atau tidak digunakan tidak mengontaminasi proses baru.
-   - Mengekspor data dari database SQLite ke `Invoices.xlsx`, `ERP_Dummy.xlsx`, dan `ProcessLogs.xlsx` dengan mempertahankan struktur template.
-   - Memindahkan file invoice ke direktori arsip sesuai hasil akhir:
-     - `/Processed/Success/`
-     - `/Processed/Rejected/`
-     - `/Processed/Failed/`
-
----
-
-## 3. Prasyarat & Instalasi
-
-### Prasyarat
-- Python 3.10+
-- Browser Microsoft Edge atau Google Chrome (terinstal bawaan pada sistem Windows)
-
-### Instalasi Dependensi
-Jalankan perintah berikut pada terminal:
+### 3. Install Dependensi
 ```bash
 pip install -r requirements.txt
 ```
 
----
+### 4. Konfigurasi Environment (`.env`)
+Salin file `.env.example` ke `.env`:
+```bash
+# Windows PowerShell
+Copy-Item .env.example .env
 
-## 4. Konfigurasi Sistem
-
-### File `Config.xlsx`
-Konfigurasi bisnis dibaca secara dinamis dari sheet `Config_T`:
-- `ThresholdAmount`: Batas nominal untuk memicu alur approval (default: `1000000`).
-- `FormsUrl`: URL Google Form atau Microsoft Form ERP Anda.
-- `ExcelERPPath`: Path output `ERP_Dummy.xlsx`.
-- `ApproverEmail`: Alamat email approver yang dituju (`aldidadenis@gmail.com`).
-
-### File `.env`
-Salin template `.env.example` menjadi `.env` dan lengkapi kredensial:
+# Bash
+cp .env.example .env
+```
+Sesuaikan isi `.env` sesuai kebutuhan:
 ```ini
 # Google Cloud Vision API Key
 VISION_API_KEY=AIzaSyD9bQ80NIXZyQYz_PclqLKYTlUUusrV6iA
 
-# Mailbox Configuration (Opsional - jika menggunakan inbox aktif)
+# Mailbox (Opsional - IMAP/SMTP)
 IMAP_SERVER=imap.gmail.com
 IMAP_PORT=993
 IMAP_USER=your_email@gmail.com
@@ -145,86 +79,157 @@ SMTP_PORT=587
 SMTP_USER=your_email@gmail.com
 SMTP_PASSWORD=your_app_password
 
-# Pengaturan Browser Automation
+# Pengaturan Browser & Form ERP
 HEADLESS=false
 BROWSER_TYPE=edge
-
-# URL Form ERP (Google Form viewform link)
 FORMS_URL=https://docs.google.com/forms/d/e/YOUR_FORM_ID/viewform
 ```
 
----
-
-## 5. Cara Menjalankan Program
-
-### 1. Menjalankan Otomasi Penuh (Batch Mode)
-Memproses seluruh invoice dalam folder `Sample Invoice/` dengan browser tampak (visible) dan auto-approve:
-```bash
-python main.py --source "Sample Invoice" --auto-approve
-```
-
-### 2. Menjalankan dengan Mode Headless (Latar Belakang)
-```bash
-python main.py --source "Sample Invoice" --auto-approve --headless
-```
-
-### 3. Menjalankan dengan Mode Interaktif Approval
-Setiap invoice yang nominalnya melebihi `ThresholdAmount` akan meminta konfirmasi manual di terminal:
-```bash
-python main.py --source "Sample Invoice"
-```
-
-### 4. Menjalankan Otomasi via Email (IMAP)
-Membaca invoice lampiran dari akun email yang dikonfigurasi di `.env`:
-```bash
-python main.py --source email
-```
-
-### 5. Memindahkan File Asli ke `/Processed`
-Tambahkan flag `--move` agar file sumber dipindahkan (bukan diduplikasi/copy):
-```bash
-python main.py --source inbox --move
-```
+### 5. Konfigurasi Bisnis (`Config.xlsx`)
+File `Config.xlsx` (sheet `Config_T`) memuat parameter operasional:
+- `ThresholdAmount`: Ambang batas nominal untuk approval (default: `1000000`).
+- `ApproverEmail`: Email tujuan approval request & notifikasi (default: `aldidadenis@gmail.com`).
+- `FormsUrl`: URL Google Form ERP (kosongkan untuk menggunakan mock HTML offline).
+- `ExcelERPPath`: Lokasi file export ERP (`ERP_Dummy.xlsx`).
 
 ---
 
-## 6. Pengujian & Verifikasi (Self-Verification)
+## 4. Cara Menjalankan Sistem
 
-Tersedia unit & integration test assert-based untuk memverifikasi logika modul tanpa dependensi luar:
-```bash
-python tests/test_automation.py
-```
+### Mode Eksekusi Utama
 
-Output pengujian:
-```text
->>> Running Self-Verification Tests...
-[PASS] test_config_loader
-[PASS] test_regex_extractor
-[PASS] test_po_validator
-[PASS] test_approval_threshold
-[PASS] test_database_and_excel_export
+1. **Jalankan Uji Verifikasi Mandiri (Self-Check Tests)**
+   ```bash
+   python tests/test_automation.py
+   ```
 
-ALL AUTOMATION TESTS PASSED SUCCESSFULLY!
-```
+2. **Proses Batch Faktur Contoh (Auto-Approve + Visible Browser)**
+   ```bash
+   python main.py --source "Sample Invoice" --auto-approve
+   ```
+
+3. **Proses Mode Headless (Browser di Latar Belakang)**
+   ```bash
+   python main.py --source "Sample Invoice" --auto-approve --headless
+   ```
+
+4. **Proses dengan Approval Manual Interaktif (Terminal Prompt)**
+   ```bash
+   python main.py --source "Sample Invoice"
+   ```
+
+5. **Proses dari Email Inbox (IMAP Live)**
+   ```bash
+   python main.py --source email
+   ```
+
+6. **Memindahkan File Asli (Bukan Copy)**
+   ```bash
+   python main.py --source inbox --move
+   ```
+
+### Ringkasan Argumen CLI
+
+| Argumen | Tipe | Deskripsi |
+| :--- | :--- | :--- |
+| `--source` | `str` | Sumber file faktur (`"Sample Invoice"`, `inbox`, `email`, atau path folder) |
+| `--auto-approve` | `flag` | Otomatis menyetujui faktur di atas ambang batas tanpa konfirmasi |
+| `--headless` | `flag` | Menjalankan browser posting ERP tanpa menampilkan antarmuka visual |
+| `--move` | `flag` | Memindahkan file sumber ke direktori `Processed/` alih-alih menyalin |
+| `--keep-history` | `flag` | Mempertahankan data SQLite lama tanpa reset sinkronisasi batch |
+| `--limit` | `int` | Membatasi jumlah faktur yang diproses dalam satu sesi |
 
 ---
 
-## 7. Format Google Form ERP & Penilaian Reviewer
+## 5. Arsitektur & Struktur Kode
 
-### Struktur & Format Google Form yang Dibutuhkan:
-Buat Google Form baru di Google Drive / Google Forms dengan judul form bebas (misal: `ERP System - Invoice Entry`) dan tambahkan 6 pertanyaan bertipe **Jawaban Singkat (Short answer)** secara berurutan:
-1. `Invoice Number` (Short answer / Jawaban singkat)
-2. `Vendor Name` (Short answer / Jawaban singkat)
-3. `PO Number` (Short answer / Jawaban singkat)
-4. `Amount` (Short answer / Jawaban singkat)
-5. `Currency` (Short answer / Jawaban singkat)
-6. `Posting Reference` (Short answer / Jawaban singkat)
+### Arsitektur Perangkat Lunak
 
-Salin link form (format `https://docs.google.com/forms/d/e/.../viewform`) dan masukkan ke parameter `FormsUrl` di `Config.xlsx` atau `FORMS_URL` di file `.env`.
+Sistem dibangun berdasarkan prinsip **Modular Clean Architecture** dan **Separation of Concerns (SoC)**:
 
-### Catatan Penting:
-- **Google Form Smart Matching:** Sistem secara otomatis mendeteksi kontainer pertanyaan berdasarkan kata kunci judul pertanyaan maupun urutan sekuensial, mengisi nilai data faktur & `PostingRef`, lalu mengklik tombol `Kirim` / `Submit`.
-- **Offline Fallback:** Jika `FormsUrl` dibiarkan default atau kosong, sistem secara otomatis menggunakan form lokal `templates/mock_erp_form.html` sehingga pipeline tetap dapat dieksekusi 100% reliabel offline.
-- **Sinkronisasi Database:** Setiap *batch run* baru melakukan sinkronisasi database secara *fresh* agar data lama yang sudah selesai diproses tidak menghambat atau mencemari *running* data terupdate.
-- **Notifikasi Email `aldidadenis@gmail.com`:** Approval request PO dan konfirmasi invoice yang sudah approved secara otomatis dialamatkan ke `aldidadenis@gmail.com` lengkap dengan lampiran invoice dan `PostingRef`.
-- **Integritas Export:** File export `Invoices.xlsx`, `ERP_Dummy.xlsx`, dan `ProcessLogs.xlsx` dihasilkan langsung dari SQLite database dengan menjaga integritas data dan template asli.
+```
+                  ┌────────────────────────┐
+                  │        main.py         │ (Pipeline Orchestrator)
+                  └───────────┬────────────┘
+                              │
+     ┌────────────────────────┼────────────────────────┐
+     ▼                        ▼                        ▼
+┌─────────────┐        ┌─────────────┐          ┌─────────────┐
+│   config/   │        │    core/    │          │  modules/   │
+│ settings.py │        │ database.py │          │ (Domain Svc)│
+└─────────────┘        │  logger.py  │          └─────────────┘
+                       └─────────────┘                 │
+     ┌─────────────────────────────────────────────────┼────────────────────────┐
+     ▼                   ▼              ▼              ▼                        ▼
+email_intake     image_preprocessor  ocr_engine    extractor                validator
+     ▼                   ▼              ▼              ▼                        ▼
+approval            erp_poster       exporter      archiver             (OpenCV/RegEx)
+```
+
+1. **Orchestrator Layer (`main.py`)**: Mengendalikan siklus hidup eksekusi, penanganan error per item faktur, deduplikasi file, dan sinkronisasi sesi database.
+2. **Configuration Layer (`config/settings.py`)**: Penggabung hierarkis konfigurasi antara file Excel (`Config.xlsx`), environment variables (`.env`), dan nilai *fallback default*.
+3. **Core & Persistence Layer (`core/`)**:
+   - `database.py`: Mengelola koneksi SQLite, skema tabel (`invoices`, `erp_postings`, `process_logs`), status transaksi, dan mekanisme *fresh batch synchronization*.
+   - `logger.py`: Pencatatan log terstruktur dua arah (terminal output dan sinkronisasi tabel audit log database).
+4. **Domain Services Layer (`modules/`)**:
+   - `email_intake.py`: Menangani koneksi IMAP, unduh lampiran, dan pembacaan folder lokal.
+   - `image_preprocessor.py`: Deteksi kualitas citra (Laplacian blur, kontras gelap/terang, refleksi flash, noda) dan koreksi otomatis skew/kemiringan.
+   - `ocr_engine.py`: Klien REST API Google Cloud Vision untuk ekstraksi raw text.
+   - `extractor.py`: RegEx engine deterministik untuk ekstraksi metadata invoice tanpa ketergantungan model NLP berat.
+   - `validator.py`: Business rule validator terhadap master `PurchaseOrders.csv`.
+   - `approval.py`: Evaluasi batas persetujuan serta pengiriman notifikasi/konfirmasi via SMTP ke `aldidadenis@gmail.com`.
+   - `erp_poster.py`: Automasi web form berbasis native Chrome DevTools Protocol (CDP) dengan fallback Selenium.
+   - `exporter.py`: Pengekspor data SQLite ke template Excel secara konsisten dan aman dari *file lock*.
+   - `archiver.py`: Pengarsip file faktur dengan hashing SHA-256 untuk mencegah duplikasi file.
+
+### Struktur Direktori
+
+```
+IT Automation Developer Use Case/
+├── config/
+│   ├── __init__.py
+│   └── settings.py              # Loader konfigurasi dinamis (Config.xlsx + .env)
+├── core/
+│   ├── __init__.py
+│   ├── database.py              # Repository SQLite & skema tabel transaksi
+│   └── logger.py                # Logger audit terstruktur & sink database
+├── modules/
+│   ├── __init__.py
+│   ├── approval.py              # Logika approval threshold & notifikasi email
+│   ├── archiver.py              # Pengarsip & deduplikasi file ke folder Processed
+│   ├── email_intake.py          # Listener IMAP & loader attachment lokal
+│   ├── erp_poster.py            # Otomasi pengisian form browser (Edge / Chrome)
+│   ├── exporter.py              # Sinkronisasi export SQLite ke format Excel
+│   ├── extractor.py             # Parser RegEx deterministik bidang faktur
+│   ├── image_preprocessor.py    # Asesmen kualitas gambar & koreksi citra OpenCV
+│   ├── ocr_engine.py            # Klien Google Cloud Vision OCR
+│   └── validator.py             # Validasi kecocokan master PurchaseOrders.csv
+├── templates/
+│   ├── Config.xlsx              # Template file konfigurasi operasional bisnis
+│   ├── ERP_Dummy.xlsx           # Template data luaran PostedInvoices
+│   ├── Invoices.xlsx            # Template data luaran Invoices_T
+│   ├── ProcessLogs.xlsx         # Template data luaran Logs_T audit trail
+│   └── mock_erp_form.html       # Form ERP HTML mandiri untuk pengujian luring
+├── tests/
+│   ├── __init__.py
+│   └── test_automation.py       # Test suite verifikasi mandiri logika modul
+├── data/
+│   └── automation.db            # Database SQLite transaksi (dibuat otomatis)
+├── inbox/                       # Direktori penampung faktur masuk lokal
+├── Processed/                   # Direktori arsip hasil akhir faktur
+│   ├── Failed/                  # Faktur gagal baca/ekstraksi
+│   ├── Rejected/                # Faktur ditolak PO / ditolak approver
+│   └── Success/                 # Faktur tervalidasi & berhasil diposting
+├── Sample Invoice/              # Sampel gambar faktur untuk pengujian
+├── .env.example                 # Contoh template konfigurasi kredensial
+├── .env                         # Konfigurasi aktif lokal (diabaikan oleh git)
+├── .gitignore                   # Konfigurasi ignore file cache/database/secrets
+├── Config.xlsx                  # File aktif konfigurasi operasional
+├── ERP_Dummy.xlsx               # Output sinkronisasi posted ERP records
+├── Invoices.xlsx                # Output sinkronisasi seluruh record faktur
+├── ProcessLogs.xlsx             # Output sinkronisasi riwayat audit trail log
+├── PurchaseOrders.csv           # Master data Purchase Order aktif
+├── main.py                      # CLI entrypoint & orchestrator pipeline
+├── requirements.txt             # Daftar dependensi modul Python
+└── README.md                    # Dokumentasi teknis sistem
+```
