@@ -5,6 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import openpyxl
+import re
 import shutil
 import tempfile
 import cv2
@@ -291,6 +292,23 @@ def test_approved_invoice_email_and_fresh_run():
         # Test approved invoice email dispatch
         cfg = AppConfig.load()
         appr = ApprovalService(cfg, auto_approve=True)
+
+        # Test reply body extraction (should strip quoted instructions)
+        raw_quoted_email = """APPROVE
+        
+On Sat, Nov 7, 2026 at 1:40 AM aldidadenis@gmail.com wrote:
+> Please reply to this email with 'APPROVE' or 'REJECT'.
+"""
+        clean_text = appr._extract_reply_body(raw_quoted_email)
+        assert clean_text == "APPROVE", f"Expected 'APPROVE', got '{clean_text}'"
+
+        # Test outgoing email template is NOT detected as an approve reply
+        req_body = """Hello Approver,
+Please reply to this email with 'APPROVE' or 'REJECT'.
+"""
+        clean_req = appr._extract_reply_body(req_body)
+        assert not re.search(r"\bAPPROVE\b", clean_req), f"Expected no standalone APPROVE token, got '{clean_req}'"
+
         dummy_invoice = tmp_dir / "invoice.jpg"
         dummy_invoice.write_bytes(b"dummy")
 
