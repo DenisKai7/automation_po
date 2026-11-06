@@ -66,7 +66,7 @@ cp .env.example .env
 Sesuaikan isi `.env` sesuai kebutuhan:
 ```ini
 # Google Cloud Vision API Key
-VISION_API_KEY=AIzaSyD9bQ80NIXZyQYz_PclqLKYTlUUusrV6iA
+VISION_API_KEY=default
 
 # Mailbox (Opsional - IMAP/SMTP)
 IMAP_SERVER=imap.gmail.com
