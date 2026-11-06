@@ -16,7 +16,7 @@ class AppConfig:
     threshold_amount: float = 1000000.0
     forms_url: str = ""
     excel_erp_path: str = "/ERP_Dummy.xlsx"
-    approver_email: str = "approver@example.com"
+    approver_email: str = "aldidadenis@gmail.com"
 
     # From .env / Secrets
     vision_api_key: str = os.getenv("VISION_API_KEY", "AIzaSyD9bQ80NIXZyQYz_PclqLKYTlUUusrV6iA")
@@ -72,6 +72,10 @@ class AppConfig:
         env_form_url = os.getenv("FORMS_URL", "").strip()
         if env_form_url:
             cfg.forms_url = env_form_url
+
+        env_approver = os.getenv("APPROVER_EMAIL", "").strip()
+        if env_approver:
+            cfg.approver_email = env_approver
 
         # Ensure essential directories exist
         cfg.processed_dir.mkdir(parents=True, exist_ok=True)

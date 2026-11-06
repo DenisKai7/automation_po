@@ -22,7 +22,7 @@ from modules.validator import POValidator
 def test_config_loader():
     cfg = AppConfig.load()
     assert cfg.threshold_amount == 1000000.0, f"Expected 1000000.0, got {cfg.threshold_amount}"
-    assert cfg.approver_email == "approver@example.com", f"Expected approver@example.com, got {cfg.approver_email}"
+    assert cfg.approver_email == "aldidadenis@gmail.com", f"Expected aldidadenis@gmail.com, got {cfg.approver_email}"
     print("[PASS] test_config_loader")
 
 
@@ -267,6 +267,49 @@ def test_database_and_excel_export():
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def test_approved_invoice_email_and_fresh_run():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        db_path = tmp_dir / "sync_test.db"
+        db = Database(db_path)
+
+        # Seed data
+        db.save_invoice({"correlation_id": "C1", "invoice_number": "INV-001", "status": "COMPLETED"})
+        db.save_erp_posting({"invoice_number": "INV-001", "posting_ref": "REF-01"})
+        db.add_process_log("C1", "TEST", "OK", "msg")
+
+        # Test fresh run reset
+        cleared = db.reset_for_fresh_run()
+        assert cleared["invoices_cleared"] == 1
+        assert cleared["erp_cleared"] == 1
+        assert cleared["logs_cleared"] == 1
+
+        with db.get_connection() as conn:
+            assert conn.execute("SELECT count(*) FROM invoices").fetchone()[0] == 0
+            assert conn.execute("SELECT count(*) FROM erp_postings").fetchone()[0] == 0
+
+        # Test approved invoice email dispatch
+        cfg = AppConfig.load()
+        appr = ApprovalService(cfg, auto_approve=True)
+        dummy_invoice = tmp_dir / "invoice.jpg"
+        dummy_invoice.write_bytes(b"dummy")
+
+        sent = appr.send_approved_invoice_email(
+            correlation_id="C-TEST",
+            invoice_number="INV-2025-001",
+            vendor_name="PT Test",
+            po_number="PO-001",
+            amount=1000000.0,
+            currency="IDR",
+            posting_ref="REF-TEST",
+            file_path=dummy_invoice
+        )
+        assert sent is True
+        print("[PASS] test_approved_invoice_email_and_fresh_run")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     print(">>> Running Self-Verification Tests...")
     test_config_loader()
@@ -276,4 +319,5 @@ if __name__ == "__main__":
     test_image_preprocessor_and_guidance()
     test_archiver_deduplication()
     test_database_and_excel_export()
+    test_approved_invoice_email_and_fresh_run()
     print("\nALL AUTOMATION TESTS PASSED SUCCESSFULLY!")

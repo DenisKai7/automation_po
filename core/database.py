@@ -72,6 +72,19 @@ class Database:
 
             conn.commit()
 
+    def reset_for_fresh_run(self) -> dict:
+        """Clears old historical data so the new run uses only the active sample/updated dataset."""
+        with self.get_connection() as conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM invoices")
+            inv_c = c.rowcount
+            c.execute("DELETE FROM erp_postings")
+            erp_c = c.rowcount
+            c.execute("DELETE FROM process_logs")
+            log_c = c.rowcount
+            conn.commit()
+        return {"invoices_cleared": inv_c, "erp_cleared": erp_c, "logs_cleared": log_c}
+
     def find_completed_invoice(self, file_hash: Optional[str] = None, invoice_number: Optional[str] = None) -> Optional[dict]:
         """Checks if the same file or invoice number was already successfully processed and posted to ERP."""
         with self.get_connection() as conn:

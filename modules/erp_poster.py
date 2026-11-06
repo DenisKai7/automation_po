@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 import os
 import shutil
+import socket
 import subprocess
 import time
 from typing import Optional
@@ -24,6 +25,11 @@ class ERPBrowserPoster:
     def __init__(self, config: AppConfig):
         self.config = config
         self.browser_path = self._find_browser()
+
+    def _find_free_port(self) -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
 
     def _find_browser(self) -> str:
         # Check Edge first (standard on Windows), then Chrome
@@ -61,9 +67,9 @@ class ERPBrowserPoster:
 
         submitted_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Launch browser with remote debugging port
-        port = 9222
-        user_data = self.config.data_dir / f"browser_profile_{int(time.time())}"
+        # Launch browser with isolated dynamic port and profile
+        port = self._find_free_port()
+        user_data = self.config.data_dir / f"browser_profile_{port}_{int(time.time()*1000)}"
         user_data.mkdir(parents=True, exist_ok=True)
 
         args = [
@@ -81,21 +87,34 @@ class ERPBrowserPoster:
 
         ws = None
         try:
-            # Connect to CDP page
+            # Connect to CDP page with retry
             tabs_url = f"http://127.0.0.1:{port}/json"
-            tabs = httpx.get(tabs_url, timeout=5).json()
-            if not tabs:
-                raise RuntimeError("No active browser tabs found via CDP.")
+            tabs = None
+            for _ in range(10):
+                try:
+                    res = httpx.get(tabs_url, timeout=3)
+                    if res.status_code == 200:
+                        tabs = res.json()
+                        if tabs:
+                            break
+                except Exception:
+                    pass
+                time.sleep(0.5)
 
-            ws_url = tabs[0]["webSocketDebuggerUrl"]
-            ws = websocket.create_connection(ws_url, timeout=10)
+            if not tabs:
+                raise RuntimeError(f"No active browser tabs found via CDP on port {port}.")
+
+            # Find page tab
+            target_tab = next((t for t in tabs if t.get("type") == "page"), tabs[0])
+            ws_url = target_tab["webSocketDebuggerUrl"]
+            ws = websocket.create_connection(ws_url, timeout=15)
 
             # 1. Navigate to form
             ws.send(json.dumps({"id": 1, "method": "Page.navigate", "params": {"url": target_url}}))
             ws.recv()
             time.sleep(2.5)  # Wait for page elements to render
 
-            # 2. Inject form data using universal script for MS Forms, Google Forms & Mock Form
+            # 2. Inject form data using universal script for Google Forms, MS Forms & Mock Form
             js_script = f"""
             (function() {{
                 const data = {{
@@ -116,7 +135,20 @@ class ERPBrowserPoster:
                     data.postingRef
                 ];
 
-                // Check Mock Form or standard ID inputs
+                function setVal(input, val) {{
+                    if (!input) return;
+                    input.focus();
+                    input.value = val;
+                    try {{ document.execCommand('selectAll', false, null); }} catch(e){{}}
+                    try {{ document.execCommand('insertText', false, String(val)); }} catch(e){{}}
+                    input.value = val;
+                    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    try {{ input.dispatchEvent(new InputEvent('input', {{ bubbles: true, data: String(val) }})); }} catch(e){{}}
+                    input.blur();
+                }}
+
+                // Method 1: Check Mock Form or standard ID inputs
                 const idMap = {{
                     'invoice_number': data.invoiceNumber,
                     'vendor_name': data.vendorName,
@@ -130,34 +162,73 @@ class ERPBrowserPoster:
                 for (const [id, val] of Object.entries(idMap)) {{
                     const el = document.getElementById(id);
                     if (el) {{
-                        el.value = val;
-                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        setVal(el, val);
                         filledCount++;
                     }}
                 }}
 
+                // Method 2: Google Forms smart container matching by label/question
                 if (filledCount < 6) {{
-                    // Fallback to sequential input query (MS Forms / Google Forms)
+                    const containers = Array.from(document.querySelectorAll('div[role="listitem"], .Qr7Oae, div[jsmodel]'));
+                    if (containers.length > 0) {{
+                        containers.forEach(container => {{
+                            const text = (container.innerText || container.textContent || '').toLowerCase();
+                            const inp = container.querySelector('input[type="text"], input:not([type]), textarea');
+                            if (!inp) return;
+
+                            if (text.includes('invoice') || text.includes('faktur')) {{
+                                setVal(inp, data.invoiceNumber);
+                                filledCount++;
+                            }} else if (text.includes('vendor') || text.includes('pemasok')) {{
+                                setVal(inp, data.vendorName);
+                                filledCount++;
+                            }} else if (text.includes('po') || text.includes('purchase')) {{
+                                setVal(inp, data.poNumber);
+                                filledCount++;
+                            }} else if (text.includes('amount') || text.includes('nominal') || text.includes('total') || text.includes('jumlah')) {{
+                                setVal(inp, data.amount);
+                                filledCount++;
+                            }} else if (text.includes('currency') || text.includes('uang')) {{
+                                setVal(inp, data.currency);
+                                filledCount++;
+                            }} else if (text.includes('posting') || text.includes('ref')) {{
+                                setVal(inp, data.postingRef);
+                                filledCount++;
+                            }}
+                        }});
+                    }}
+                }}
+
+                // Method 3: Fallback to sequential visible inputs (MS Forms / Google Forms)
+                if (filledCount < 6) {{
                     const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type]), textarea'));
                     const targetInputs = inputs.filter(el => el.offsetParent !== null || el.offsetWidth > 0);
                     targetInputs.slice(0, 6).forEach((input, idx) => {{
-                        input.value = values[idx] || '';
-                        input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                        input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        if (values[idx] !== undefined) {{
+                            setVal(input, values[idx]);
+                        }}
                     }});
                 }}
 
-                // Click submit button
+                // Click submit button for Google Forms / MS Forms / Mock Form
                 setTimeout(() => {{
-                    const submitBtn = document.querySelector('button[type="submit"]') ||
-                                      document.querySelector('button[data-automation-id="submitButton"]') ||
-                                      document.querySelector('div[role="button"][jsname]') ||
-                                      document.querySelector('button');
+                    const allButtons = Array.from(document.querySelectorAll('div[role="button"], button, input[type="submit"]'));
+                    const submitBtn = allButtons.find(b => {{
+                        const txt = (b.innerText || b.textContent || b.value || '').trim().toLowerCase();
+                        const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+                        return txt === 'kirim' || txt === 'submit' || txt === 'send' ||
+                               txt.includes('kirim') || txt.includes('submit') ||
+                               b.getAttribute('data-automation-id') === 'submitButton' ||
+                               aria.includes('kirim') || aria.includes('submit') ||
+                               b.type === 'submit';
+                    }}) || document.querySelector('div[role="button"][jscontroller]') ||
+                          document.querySelector('button[type="submit"]') ||
+                          document.querySelector('button');
+
                     if (submitBtn) {{
                         submitBtn.click();
                     }}
-                }}, 600);
+                }}, 700);
 
                 return true;
             }})();
@@ -193,10 +264,15 @@ class ERPBrowserPoster:
                     ws.close()
                 except Exception:
                     pass
-            proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except Exception:
-                proc.kill()
+            # Kill process tree cleanly to prevent zombie Chromium child processes
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    proc.kill()
             time.sleep(0.5)
             shutil.rmtree(user_data, ignore_errors=True)

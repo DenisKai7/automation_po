@@ -35,7 +35,8 @@ def run_pipeline(
     move_files: bool = False,
     force: bool = False,
     config_file: str | None = None,
-    limit: int | None = None
+    limit: int | None = None,
+    keep_history: bool = False
 ) -> None:
     # 1. Initialize Configuration
     config = AppConfig.load(config_file)
@@ -44,6 +45,11 @@ def run_pipeline(
 
     # 2. Initialize Core Services
     db = Database(config.db_path)
+
+    # Database Synchronization: fresh session per batch run to avoid obsolete data contamination
+    if not keep_history and not force:
+        db.reset_for_fresh_run()
+
     logger = AutomationLogger(db)
     ocr = OCREngine(config.vision_api_key)
     validator = POValidator(config.purchase_orders_csv)
@@ -55,13 +61,11 @@ def run_pipeline(
 
     # Clean up prior duplicate artifacts from previous runs
     removed_files = archiver.cleanup_duplicates()
-    db_cleanup = db.cleanup_duplicate_records()
-    if removed_files or db_cleanup["invoices_removed"]:
-        logger.log("SYSTEM", "CLEANUP", "INFO",
-                   f"Deduplication cleanup: removed {removed_files} redundant files, {db_cleanup['invoices_removed']} duplicate DB rows")
+    if removed_files:
+        logger.log("SYSTEM", "CLEANUP", "INFO", f"Deduplication cleanup: removed {removed_files} redundant files")
 
     logger.log("SYSTEM", "INITIALIZATION", "INFO",
-               f"Threshold: {config.threshold_amount:,.0f} IDR | Headless: {config.headless}")
+               f"Approver: {config.approver_email} | Threshold: {config.threshold_amount:,.0f} IDR | Headless: {config.headless}")
 
     # 3. Retrieve Invoices
     files = intake_svc.get_invoices_to_process(source)
@@ -73,8 +77,11 @@ def run_pipeline(
     if limit:
         files = files[:limit]
 
-    logger.log("SYSTEM", "INTAKE", "INFO", f"Loaded {len(files)} invoice(s) for processing.")
+    logger.log("SYSTEM", "INTAKE", "INFO", f"Loaded {len(files)} invoice(s) for active run.")
     print(f"\n>>> Starting IT Automation Pipeline ({len(files)} files found)...\n")
+
+    # In-batch duplicate tracking
+    processed_invoices_in_batch = set()
 
     # 4. Process Each Invoice End-to-End
     for idx, file_path in enumerate(files, 1):
@@ -84,17 +91,6 @@ def run_pipeline(
 
         print(f"[{idx}/{len(files)}] Processing: {file_name} (ID: {corr_id})")
         logger.log(corr_id, "INTAKE", "SUCCESS", f"Processing file: {file_name} (hash: {file_hash[:10]}...)")
-
-        # Step 1.5: Idempotency / Deduplication Check
-        if not force:
-            existing = db.find_completed_invoice(file_hash=file_hash)
-            if existing:
-                msg = f"Invoice '{file_name}' already successfully processed with PostingRef '{existing.get('posting_ref')}'. Skipping duplicate ERP submission."
-                logger.log(corr_id, "DEDUPLICATION", "SKIPPED", msg)
-                print(f"    -> [DEDUPLICATION] {msg}")
-                # Ensure properly archived in Success without numbered duplicate
-                archiver.archive(file_path, "Success", move=move_files, overwrite=True)
-                continue
 
         # Step 2: Computer Vision Quality Assessment & Pre-processing
         quality_report = None
@@ -153,30 +149,18 @@ def run_pipeline(
                 except OSError:
                     pass
 
-        # Check secondary deduplication by Invoice Number if already in DB
-        if extracted and extracted.invoice_number and not force:
-            existing_by_num = db.find_completed_invoice(invoice_number=extracted.invoice_number)
-            if existing_by_num:
-                stored_hash = existing_by_num.get("file_hash")
-                if stored_hash is None or stored_hash == file_hash:
-                    # Same document previously processed, sync file_hash
-                    if stored_hash is None:
-                        db.update_invoice(existing_by_num["correlation_id"], {"file_hash": file_hash})
-                    msg = f"Invoice '{file_name}' ({extracted.invoice_number}) already successfully posted with Ref '{existing_by_num.get('posting_ref')}'. Skipping duplicate."
-                    logger.log(corr_id, "DEDUPLICATION", "SKIPPED", msg)
-                    print(f"    -> [DEDUPLICATION] {msg}")
-                    archiver.archive(file_path, "Success", move=move_files, overwrite=True)
-                    continue
-                else:
-                    msg = f"InvoiceNumber '{extracted.invoice_number}' already posted to ERP with Ref '{existing_by_num.get('posting_ref')}'. Duplicate document rejected."
-                    logger.log(corr_id, "DEDUPLICATION", "REJECTED", msg)
-                    print(f"    -> [DEDUPLICATION] {msg}")
-                    archiver.archive(file_path, "Rejected", move=move_files, overwrite=True)
-                    continue
+        # Check in-batch duplicate by Invoice Number
+        if extracted and extracted.invoice_number and extracted.invoice_number != "UNKNOWN":
+            if extracted.invoice_number in processed_invoices_in_batch and not force:
+                msg = f"InvoiceNumber '{extracted.invoice_number}' duplicate within batch. Rejected."
+                logger.log(corr_id, "DEDUPLICATION", "REJECTED", msg)
+                print(f"    -> [DEDUPLICATION] {msg}")
+                archiver.archive(file_path, "Rejected", move=move_files, overwrite=True)
+                continue
+            processed_invoices_in_batch.add(extracted.invoice_number)
 
         if not extracted.is_valid:
             error_reason = extracted.error_message or "Extraction failed"
-            # Provide actionable remediation advice
             if "Corrupted" in error_reason:
                 error_reason += ". SARAN: Minta vendor mengirimkan ulang file PDF/gambar invoice resmi yang bersih."
             elif "PO_Number" in error_reason:
@@ -239,13 +223,14 @@ def run_pipeline(
             archiver.archive(file_path, "Rejected", move=move_files, overwrite=True)
             continue
 
-        # Step 6: Approval Workflow
+        # Step 6: Approval Workflow (PO Validation passed -> Approval by email when needed)
         approval = approval_svc.evaluate(
             corr_id,
             extracted.invoice_number or "",
             extracted.vendor_name or "",
             extracted.amount or 0.0,
-            extracted.currency
+            extracted.currency,
+            po_number=extracted.po_number or ""
         )
         logger.log(corr_id, "APPROVAL", approval.status, approval.message)
         db.update_invoice(corr_id, {
@@ -258,7 +243,7 @@ def run_pipeline(
             archiver.archive(file_path, "Rejected", move=move_files, overwrite=True)
             continue
 
-        # Step 7: ERP Browser Posting
+        # Step 7: ERP Browser Posting (Web Form: Google Forms / MS Forms / Mock)
         posting_ref = erp_poster.generate_posting_ref(corr_id)
         post_payload = {
             "invoice_number": extracted.invoice_number,
@@ -291,16 +276,30 @@ def run_pipeline(
             })
             archived_path = archiver.archive(file_path, "Success", move=move_files, overwrite=True)
             db.update_invoice(corr_id, {"file_path": str(archived_path)})
+
+            # Step 7.5: Send Approved Invoice Email with Attachment to aldidadenis@gmail.com
+            mail_sent = approval_svc.send_approved_invoice_email(
+                correlation_id=corr_id,
+                invoice_number=extracted.invoice_number or "",
+                vendor_name=extracted.vendor_name or "",
+                po_number=extracted.po_number or "",
+                amount=extracted.amount or 0.0,
+                currency=extracted.currency,
+                posting_ref=posting_ref,
+                file_path=archived_path
+            )
+            logger.log(corr_id, "EMAIL_APPROVED", "SUCCESS" if mail_sent else "WARNING",
+                       f"Approved invoice notification sent to {config.approver_email} (Ref: {posting_ref})")
         else:
             logger.log(corr_id, "ERP_POSTING", "FAILED", posting_result.message)
             db.update_invoice(corr_id, {"status": "FAILED"})
             archiver.archive(file_path, "Failed", move=move_files, overwrite=True)
 
-    # Step 8: Export Excel Files
+    # Step 8: Export Excel Files & Audit Logs
     print("\n>>> Exporting reports according to templates...")
     exports = exporter.export_all()
     logger.log("SYSTEM", "EXCEL_EXPORT", "SUCCESS",
-               f"Exported Invoices.xlsx, ERP_Dummy.xlsx, ProcessLogs.xlsx")
+               "Exported Invoices.xlsx, ERP_Dummy.xlsx, ProcessLogs.xlsx")
 
     print("\n================ PIPELINE EXECUTION SUMMARY ================")
     print(f" SQLite Database  : {config.db_path}")
@@ -308,6 +307,7 @@ def run_pipeline(
     print(f" ERP Dummy Export : {exports['erp_dummy']}")
     print(f" Process Logs     : {exports['process_logs']}")
     print(f" Processed Folder : {config.processed_dir}")
+    print(f" Approver Email   : {config.approver_email}")
     print("============================================================\n")
 
 
@@ -320,6 +320,7 @@ def main() -> None:
     parser.add_argument("--force", action="store_true", help="Force re-processing even if invoice was already completed")
     parser.add_argument("--config", type=str, default=None, help="Path to custom Config.xlsx")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of invoices to process")
+    parser.add_argument("--keep-history", action="store_true", help="Keep prior database records instead of fresh run synchronization")
 
     args = parser.parse_args()
     run_pipeline(
@@ -329,7 +330,8 @@ def main() -> None:
         move_files=args.move,
         force=args.force,
         config_file=args.config,
-        limit=args.limit
+        limit=args.limit,
+        keep_history=args.keep_history
     )
 
 

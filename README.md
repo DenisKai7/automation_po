@@ -82,19 +82,21 @@ IT Automation Developer Use Case/
    - Menghasilkan status: `MATCHED`, `MISMATCH`, `NOT_FOUND`, `INACTIVE_PO`, atau `INVALID`.
 
 5. **Approval Workflow (Dynamic Threshold):**
-   - Membaca `ThresholdAmount` secara dinamis dari file `Config.xlsx`.
-   - Jika `Amount > ThresholdAmount`:
-     - Mengirim notifikasi approval via SMTP ke `ApproverEmail`.
-     - Menunggu balasan `APPROVE` / `REJECT` via IMAP.
-     - Menyediakan mode interaktif terminal (`Y/n`) serta flag otomatis `--auto-approve` untuk batch/CI run.
+   - Membaca `ThresholdAmount` secara dinamis dari file `Config.xlsx` dan `ApproverEmail` (`aldidadenis@gmail.com`).
+   - Jika `Amount > ThresholdAmount` (dan PO lolos validasi):
+     - Mengirim notifikasi request approval via SMTP/IMAP ke `aldidadenis@gmail.com`.
+     - Mendukung balasan `APPROVE` / `REJECT` via IMAP, prompt terminal interaktif (`Y/n`), serta flag `--auto-approve`.
+   - Setelah faktur disetujui (APPROVED) dan berhasil diposting ke ERP:
+     - Mengirimkan email konfirmasi invoice yang sudah approved ke `aldidadenis@gmail.com` beserta lampiran dokumen invoice dan `PostingRef`.
 
-6. **Posting ERP Form (Browser Automation):**
-   - Mengirim data faktur (`InvoiceNumber`, `VendorName`, `PO_Number`, `Amount`, `Currency`, `PostingRef`) ke form web (`FormsUrl`) melalui browser (Microsoft Edge / Google Chrome).
-   - Menggunakan teknologi Chrome DevTools Protocol (CDP) native yang stabil tanpa kendala versi driver eksternal, dengan dukungan Selenium.
+6. **Posting ERP Form (Google Forms / MS Forms / Browser Automation):**
+   - Mengirim data faktur (`InvoiceNumber`, `VendorName`, `PO_Number`, `Amount`, `Currency`, `PostingRef`) ke Google Form atau web form ERP melalui browser (Microsoft Edge / Google Chrome).
+   - Menggunakan teknologi Chrome DevTools Protocol (CDP) native yang stabil tanpa kendala versi driver eksternal.
    - Menjamin nilai `PostingRef` identik pada response form, `ERP_Dummy.xlsx`, dan `Invoices.xlsx`.
    - Mendukung visual browser (visible) dan mode *headless*.
 
 7. **Export & Archiving:**
+   - Database SQLite disinkronkan secara *fresh* untuk setiap *running batch* aktif agar data lama yang sudah selesai atau tidak digunakan tidak mengontaminasi proses baru.
    - Mengekspor data dari database SQLite ke `Invoices.xlsx`, `ERP_Dummy.xlsx`, dan `ProcessLogs.xlsx` dengan mempertahankan struktur template.
    - Memindahkan file invoice ke direktori arsip sesuai hasil akhir:
      - `/Processed/Success/`
@@ -124,7 +126,7 @@ Konfigurasi bisnis dibaca secara dinamis dari sheet `Config_T`:
 - `ThresholdAmount`: Batas nominal untuk memicu alur approval (default: `1000000`).
 - `FormsUrl`: URL Google Form atau Microsoft Form ERP Anda.
 - `ExcelERPPath`: Path output `ERP_Dummy.xlsx`.
-- `ApproverEmail`: Alamat email approver yang dituju.
+- `ApproverEmail`: Alamat email approver yang dituju (`aldidadenis@gmail.com`).
 
 ### File `.env`
 Salin template `.env.example` menjadi `.env` dan lengkapi kredensial:
@@ -147,8 +149,8 @@ SMTP_PASSWORD=your_app_password
 HEADLESS=false
 BROWSER_TYPE=edge
 
-# URL Form ERP (Bisa juga diisi di sini untuk override Config.xlsx)
-FORMS_URL=https://forms.microsoft.com/your-form-url
+# URL Form ERP (Google Form viewform link)
+FORMS_URL=https://docs.google.com/forms/d/e/YOUR_FORM_ID/viewform
 ```
 
 ---
@@ -207,8 +209,22 @@ ALL AUTOMATION TESTS PASSED SUCCESSFULLY!
 
 ---
 
-## 7. Catatan Form ERP & Penilaian Reviewer
+## 7. Format Google Form ERP & Penilaian Reviewer
 
-- Jika `FormsUrl` pada `Config.xlsx` atau `.env` diarahkan ke URL Google Forms / Microsoft Forms Anda, browser akan otomatis mengisi input form dan melakukan submit.
-- Jika `FormsUrl` dibiarkan default atau kosong, sistem secara otomatis menggunakan form bawaan `templates/mock_erp_form.html` sehingga pipeline tetap dapat dieksekusi secara penuh dan reliabel dalam kondisi offline.
-- File export `Invoices.xlsx`, `ERP_Dummy.xlsx`, dan `ProcessLogs.xlsx` dihasilkan langsung dari SQLite database dengan menjaga integritas data dan template asli.
+### Struktur & Format Google Form yang Dibutuhkan:
+Buat Google Form baru di Google Drive / Google Forms dengan judul form bebas (misal: `ERP System - Invoice Entry`) dan tambahkan 6 pertanyaan bertipe **Jawaban Singkat (Short answer)** secara berurutan:
+1. `Invoice Number` (Short answer / Jawaban singkat)
+2. `Vendor Name` (Short answer / Jawaban singkat)
+3. `PO Number` (Short answer / Jawaban singkat)
+4. `Amount` (Short answer / Jawaban singkat)
+5. `Currency` (Short answer / Jawaban singkat)
+6. `Posting Reference` (Short answer / Jawaban singkat)
+
+Salin link form (format `https://docs.google.com/forms/d/e/.../viewform`) dan masukkan ke parameter `FormsUrl` di `Config.xlsx` atau `FORMS_URL` di file `.env`.
+
+### Catatan Penting:
+- **Google Form Smart Matching:** Sistem secara otomatis mendeteksi kontainer pertanyaan berdasarkan kata kunci judul pertanyaan maupun urutan sekuensial, mengisi nilai data faktur & `PostingRef`, lalu mengklik tombol `Kirim` / `Submit`.
+- **Offline Fallback:** Jika `FormsUrl` dibiarkan default atau kosong, sistem secara otomatis menggunakan form lokal `templates/mock_erp_form.html` sehingga pipeline tetap dapat dieksekusi 100% reliabel offline.
+- **Sinkronisasi Database:** Setiap *batch run* baru melakukan sinkronisasi database secara *fresh* agar data lama yang sudah selesai diproses tidak menghambat atau mencemari *running* data terupdate.
+- **Notifikasi Email `aldidadenis@gmail.com`:** Approval request PO dan konfirmasi invoice yang sudah approved secara otomatis dialamatkan ke `aldidadenis@gmail.com` lengkap dengan lampiran invoice dan `PostingRef`.
+- **Integritas Export:** File export `Invoices.xlsx`, `ERP_Dummy.xlsx`, dan `ProcessLogs.xlsx` dihasilkan langsung dari SQLite database dengan menjaga integritas data dan template asli.

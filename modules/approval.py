@@ -1,6 +1,10 @@
 from dataclasses import dataclass
+from datetime import datetime
+from email import encoders
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from pathlib import Path
 from typing import Optional
 import imaplib
 import smtplib
@@ -22,7 +26,7 @@ class ApprovalService:
         self.auto_approve = auto_approve
 
     def evaluate(self, correlation_id: str, invoice_number: str, vendor_name: str,
-                 amount: float, currency: str) -> ApprovalDecision:
+                 amount: float, currency: str, po_number: str = "") -> ApprovalDecision:
         threshold = self.config.threshold_amount
         if amount <= threshold:
             return ApprovalDecision(
@@ -33,13 +37,19 @@ class ApprovalService:
             )
 
         # Requires Approval
+        print(f"\n[EMAIL_APPROVAL] PO Validated: Invoice {invoice_number} exceeds threshold ({amount:,.0f} > {threshold:,.0f} {currency}).")
+        print(f"[EMAIL_APPROVAL] Requesting approval email to: {self.config.approver_email}")
+
         # Try sending real email if SMTP is configured
         if self.config.smtp_user and self.config.smtp_password:
-            sent = self._send_approval_email(correlation_id, invoice_number, vendor_name, amount, currency)
+            sent = self._send_approval_email(correlation_id, invoice_number, vendor_name, amount, currency, po_number)
             if sent:
                 decision = self._poll_imap_reply(correlation_id)
                 if decision:
                     return decision
+        else:
+            # ponytail: smtp offline simulation fallback, add live email relay when SMTP credentials provided in .env
+            print(f"[EMAIL_APPROVAL] [INFO] SMTP_USER/SMTP_PASSWORD di .env belum diisi -> Menggunakan simulasi lokal (email fisik TIDAK dikirim).")
 
         # Fallback to auto-approve flag if enabled
         if self.auto_approve:
@@ -47,13 +57,14 @@ class ApprovalService:
                 needs_approval=True,
                 status="APPROVED",
                 approved=True,
-                message=f"Auto-approved: {amount:,.0f} {currency} > Threshold {threshold:,.0f} {currency}"
+                message=f"Auto-approved: {amount:,.0f} {currency} > Threshold {threshold:,.0f} {currency} (Approver: {self.config.approver_email})"
             )
 
         # Interactive terminal fallback
         print("\n" + "=" * 60)
         print(f"[APPROVAL REQUIRED] Invoice: {invoice_number} | Correlation: {correlation_id}")
         print(f"Vendor: {vendor_name} | Amount: {amount:,.0f} {currency} | Threshold: {threshold:,.0f} {currency}")
+        print(f"Approver Target: {self.config.approver_email}")
         print("=" * 60)
         try:
             choice = input("Approve invoice? (Y/n): ").strip().lower()
@@ -62,14 +73,14 @@ class ApprovalService:
                     needs_approval=True,
                     status="APPROVED",
                     approved=True,
-                    message="Approved manually via interactive prompt"
+                    message=f"Approved manually via interactive prompt ({self.config.approver_email})"
                 )
             else:
                 return ApprovalDecision(
                     needs_approval=True,
                     status="REJECTED",
                     approved=False,
-                    message="Rejected manually via interactive prompt"
+                    message=f"Rejected manually via interactive prompt ({self.config.approver_email})"
                 )
         except (EOFError, KeyboardInterrupt):
             return ApprovalDecision(
@@ -79,19 +90,88 @@ class ApprovalService:
                 message="Non-interactive session: rejected by default"
             )
 
+    def send_approved_invoice_email(
+        self,
+        correlation_id: str,
+        invoice_number: str,
+        vendor_name: str,
+        po_number: str,
+        amount: float,
+        currency: str,
+        posting_ref: str,
+        file_path: Optional[Path | str] = None
+    ) -> bool:
+        """Sends approved invoice confirmation and attachment to approver/admin email."""
+        target_email = self.config.approver_email
+        subject = f"[INVOICE APPROVED] Invoice {invoice_number} - {vendor_name} (Ref: {posting_ref})"
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        body = (
+            f"Halo,\n\n"
+            f"Faktur (Invoice) berikut telah BERHASIL DISETUJUI (APPROVED) dan diproses ke sistem ERP:\n\n"
+            f"  • Nomor Invoice   : {invoice_number}\n"
+            f"  • Nama Vendor     : {vendor_name}\n"
+            f"  • Nomor PO        : {po_number}\n"
+            f"  • Total Nominal   : {amount:,.0f} {currency}\n"
+            f"  • Posting Ref ERP : {posting_ref}\n"
+            f"  • Status          : APPROVED & POSTED\n"
+            f"  • Timestamp       : {now_str}\n"
+            f"  • Correlation ID  : {correlation_id}\n\n"
+            f"Dokumen fisik invoice terlampir pada email ini.\n\n"
+            f"Salam,\nIT Automation System"
+        )
+
+        msg = MIMEMultipart()
+        msg["From"] = self.config.smtp_user or "automation@system.local"
+        msg["To"] = target_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+
+        # Attach file if available
+        if file_path:
+            p = Path(file_path)
+            if p.exists() and p.is_file():
+                try:
+                    with open(p, "rb") as f:
+                        part = MIMEBase("application", "octet-stream")
+                        part.set_payload(f.read())
+                    encoders.encode_base64(part)
+                    part.add_header("Content-Disposition", f'attachment; filename="{p.name}"')
+                    msg.attach(part)
+                except Exception as ex:
+                    print(f"[!] Warning attaching file: {ex}")
+
+        # Send via SMTP if credentials available
+        if self.config.smtp_user and self.config.smtp_password:
+            try:
+                with smtplib.SMTP(self.config.smtp_server, self.config.smtp_port, timeout=10) as server:
+                    server.starttls()
+                    server.login(self.config.smtp_user, self.config.smtp_password)
+                    server.send_message(msg)
+                print(f"[EMAIL_NOTIFICATION] Live approved invoice email successfully sent to {target_email}")
+                return True
+            except Exception as e:
+                print(f"[EMAIL_NOTIFICATION] Failed sending live email to {target_email}: {e}")
+                return False
+
+        # ponytail: offline mock notification, add live SMTP credentials in .env for external relay
+        print(f"[EMAIL_NOTIFICATION] [INFO] SMTP_USER/SMTP_PASSWORD di .env belum diisi -> Email fisik TIDAK dikirim ke {target_email} (Simulasi Offline).")
+        return True
+
     def _send_approval_email(self, correlation_id: str, invoice_number: str,
-                             vendor_name: str, amount: float, currency: str) -> bool:
+                             vendor_name: str, amount: float, currency: str, po_number: str = "") -> bool:
         try:
             msg = MIMEMultipart()
             msg["From"] = self.config.smtp_user
             msg["To"] = self.config.approver_email
-            msg["Subject"] = f"[APPROVAL REQUIRED] Invoice {invoice_number} (Ref: {correlation_id})"
+            msg["Subject"] = f"[APPROVAL REQUIRED] PO Validation - Invoice {invoice_number} (Ref: {correlation_id})"
 
             body = (
-                f"Hello Approver,\n\n"
-                f"An invoice requires your approval as it exceeds the threshold of {self.config.threshold_amount:,.0f} {currency}:\n\n"
+                f"Hello Approver ({self.config.approver_email}),\n\n"
+                f"An invoice has passed PO validation and requires your approval as it exceeds the threshold of {self.config.threshold_amount:,.0f} {currency}:\n\n"
                 f"Invoice Number: {invoice_number}\n"
                 f"Vendor Name: {vendor_name}\n"
+                f"PO Number: {po_number}\n"
                 f"Amount: {amount:,.0f} {currency}\n"
                 f"Correlation ID: {correlation_id}\n\n"
                 f"Please reply to this email with 'APPROVE' or 'REJECT'.\n\n"
@@ -103,8 +183,10 @@ class ApprovalService:
                 server.starttls()
                 server.login(self.config.smtp_user, self.config.smtp_password)
                 server.send_message(msg)
+            print(f"[EMAIL_APPROVAL] Live approval email successfully sent to {self.config.approver_email}")
             return True
-        except Exception:
+        except Exception as e:
+            print(f"[EMAIL_APPROVAL] Failed sending approval email to {self.config.approver_email}: {e}")
             return False
 
     def _poll_imap_reply(self, correlation_id: str, timeout_sec: int = 15) -> Optional[ApprovalDecision]:
